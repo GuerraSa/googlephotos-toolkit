@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        Google Photos Toolkit (patched)
 // @description Bulk organize your media: find space hogs, items not in albums, duplicates, bulk delete. Patched GPTK 3.3.0 + duplicate finder.
-// @version     3.4.0
+// @version     3.4.1
 // @author      xob0t (original); GuerraSa (patches, duplicate finder)
 // @homepageURL https://github.com/GuerraSa/googlephotos-toolkit#readme
 // @supportURL  https://github.com/GuerraSa/googlephotos-toolkit/issues
@@ -18,6 +18,15 @@
 // @connect     googleusercontent.com
 // @noframes
 // ==/UserScript==
+//
+// 3.4.1
+//  - FIX: Duplicate Finder trashed every copy of a confirmed group when its last "Keep" was un-ticked.
+//  - FIX: a failed album read during "Exclude Albums" returned a partial list, so album photos could be acted on
+//         (e.g. trashed). Any failed page read now stops the run instead.
+//  - FIX: Duplicate Finder's "Move to trash" stayed clickable during a second scan and could trash the wrong photos.
+//  - FIX: Duplicate Finder skipped "add kept photo to albums" silently if the album list failed or was still loading.
+//  - REMOVED: the Similarity filter. With Move to Trash it trashed originals too; use the Duplicate Finder.
+//  - Duplicate Finder look-alike comparison yields to the page, so big libraries don't freeze the tab.
 //
 // 3.4.0
 //  - NEW: Duplicate Finder merged in ("Find duplicates" button, bottom-right). No separate script needed.
@@ -46,7 +55,6 @@
 //  - NEW: Confirmation now happens AFTER matching and shows the exact item count.
 //  - NEW: Toolbar button re-inserts itself if Google re-renders the toolbar.
 //  - NEW: Esc closes the window; filter preview updates while typing; log is capped at 3000 lines.
-//  - PERF: similarity hashing uses 32-bit words + popcount instead of BigInt bit loops (much faster).
 //  - PERF: albums / shared links are fetched one at a time to avoid rate limits; retries use
 //          exponential backoff with jitter and do not retry on permanent 4xx errors.
 (function () {
@@ -251,14 +259,6 @@
           <label class="form-control"><input name="space" value="consuming" type="radio"> Consuming</label>
           <label class="form-control"><input name="space" value="non-consuming" type="radio"> Non-Consuming</label>
         </div></fieldset></details>
-
-        <details class="similarity"><summary>Similarity</summary>
-          <fieldset><span class="filter-note">Finds and groups similar images together. Best used with action Add to Album.</span></fieldset>
-          <fieldset>
-            <legend>Threshold</legend><div class="input-wrapper"><input name="similarityThreshold" type="number" placeholder="0.90" step="0.01" max="1" min="0"></div>
-            <legend>Image height</legend><div class="input-wrapper"><input name="imageHeight" type="number" placeholder="Pixels" value="16"></div>
-          </fieldset>
-        </details>
 
         <details class="size"><summary>Size</summary><fieldset>
           <legend>More Than</legend><div class="input-wrapper"><input name="lowerBoundarySize" type="number" placeholder="Bytes"></div>
@@ -656,9 +656,6 @@
           return e;
       }
   }
-  function defer(fn) {
-      return new Promise((resolve) => setTimeout(() => resolve(fn()), 0));
-  }
   function debounce(fn, wait) {
       let timer = null;
       return (...args) => {
@@ -795,7 +792,6 @@
           test: (f) => !!f.descriptionRegex,
           describe: (f) => `with description ${f.descriptionMatchType === 'exclude' ? 'not matching' : 'matching'} regex "${f.descriptionRegex}"`,
       },
-      { test: (f) => !!f.similarityThreshold, describe: (f) => `with similarity more than "${f.similarityThreshold}"` },
       {
           test: (f) => parseSize(f.minWidth) > 0 || parseSize(f.maxWidth) > 0 || parseSize(f.minHeight) > 0 || parseSize(f.maxHeight) > 0,
           describe: (f) => {
@@ -884,10 +880,6 @@
       if (!isNaN(minDuration) && minDuration < 0) return 'Error: Invalid Duration Filter (Min)';
       if (!isNaN(maxDuration) && maxDuration < 0) return 'Error: Invalid Duration Filter (Max)';
       if (!isNaN(minDuration) && !isNaN(maxDuration) && minDuration >= maxDuration) return 'Error: Invalid Duration Filter';
-      if (filter.similarityThreshold) {
-          const t = parseFloat(filter.similarityThreshold);
-          if (isNaN(t) || t <= 0 || t > 1) return 'Error: Similarity threshold must be between 0 and 1';
-      }
       return null;
   }
   function generateFilterDescription(filter) {
@@ -1697,23 +1689,21 @@
           }
           return results;
       }
+      /**
+       * Reads every page. A failed page throws (after Api's retries) instead of returning a partial list:
+       * a partial "exclude" list (Exclude Albums / Exclude Shared) would let the action hit items it should skip.
+       */
       async getAllItems(apiMethod, ...args) {
           const items = [];
           let nextPageId;
           do {
               if (!this.core.isProcessRunning) return items;
-              try {
-                  const page = await apiMethod.call(this.api, ...args, nextPageId);
-                  if (page?.items?.length > 0) {
-                      log(`Found ${page.items.length} items`);
-                      items.push(...page.items);
-                  }
-                  nextPageId = page?.nextPageId;
+              const page = await apiMethod.call(this.api, ...args, nextPageId);
+              if (page?.items?.length > 0) {
+                  log(`Found ${page.items.length} items`);
+                  items.push(...page.items);
               }
-              catch (error) {
-                  log(`Error fetching page, stopping here: ${errorMessage(error)}`, 'error');
-                  break;
-              }
+              nextPageId = page?.nextPageId;
           } while (nextPageId);
           return items;
       }
@@ -2196,175 +2186,6 @@
       return result;
   }
 
-  // ─── Similarity (difference hash) ──────────────────────────
-  async function processBatch(items, processFn, batchSize, core) {
-      const results = [];
-      for (let i = 0; i < items.length; i += batchSize) {
-          if (!core.isProcessRunning) return results;
-          const batchResults = await Promise.all(items.slice(i, i + batchSize).map((item) => (core.isProcessRunning ? processFn(item) : null)));
-          for (const r of batchResults) if (r !== null) results.push(r);
-          await defer(() => { });
-      }
-      return results;
-  }
-  let hashCanvas = null;
-  async function decodeImage(blob, width, height) {
-      if (typeof createImageBitmap === 'function') {
-          try {
-              return await createImageBitmap(blob, { resizeWidth: width, resizeHeight: height, resizeQuality: 'medium' });
-          }
-          catch {
-              // fall through to <img>
-          }
-      }
-      const url = URL.createObjectURL(blob);
-      try {
-          const img = new Image();
-          await new Promise((resolve, reject) => {
-              img.onload = () => resolve();
-              img.onerror = reject;
-              img.src = url;
-          });
-          return img;
-      }
-      finally {
-          URL.revokeObjectURL(url);
-      }
-  }
-  /** dHash packed into 32-bit words (3.3.0 used a BigInt and set bits one at a time). */
-  async function generateImageHash(hashSize, blob, core) {
-      if (!blob || !core.isProcessRunning) return null;
-      let image;
-      try {
-          image = await decodeImage(blob, hashSize + 1, hashSize);
-      }
-      catch {
-          return null;
-      }
-      if (!core.isProcessRunning) return null;
-      if (!hashCanvas) hashCanvas = document.createElement('canvas');
-      hashCanvas.width = hashSize + 1;
-      hashCanvas.height = hashSize;
-      const ctx = hashCanvas.getContext('2d', { willReadFrequently: true });
-      if (!ctx) return null;
-      // draw + read happen synchronously, so sharing one canvas across concurrent calls is safe
-      ctx.drawImage(image, 0, 0, hashSize + 1, hashSize);
-      image.close?.();
-      const pixels = ctx.getImageData(0, 0, hashSize + 1, hashSize).data;
-      const words = new Uint32Array(Math.ceil((hashSize * hashSize) / 32));
-      for (let y = 0; y < hashSize; y++) {
-          for (let x = 0; x < hashSize; x++) {
-              const pos = (y * (hashSize + 1) + x) * 4;
-              const next = pos + 4;
-              const gray1 = 0.299 * pixels[pos] + 0.587 * pixels[pos + 1] + 0.114 * pixels[pos + 2];
-              const gray2 = 0.299 * pixels[next] + 0.587 * pixels[next + 1] + 0.114 * pixels[next + 2];
-              if (gray1 > gray2) {
-                  const bit = y * hashSize + x;
-                  words[bit >>> 5] |= 1 << (bit & 31);
-              }
-          }
-      }
-      return words;
-  }
-  function popcount32(v) {
-      v = v >>> 0;
-      v = v - ((v >>> 1) & 0x55555555);
-      v = (v & 0x33333333) + ((v >>> 2) & 0x33333333);
-      return Math.imul((v + (v >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24;
-  }
-  /** Hamming distance between two packed hashes; stops counting once `limit` is exceeded. */
-  function hammingDistance(hash1, hash2, limit = Infinity) {
-      if (!hash1 || !hash2 || hash1.length !== hash2.length) return Infinity;
-      let distance = 0;
-      for (let i = 0; i < hash1.length; i++) {
-          distance += popcount32(hash1[i] ^ hash2[i]);
-          if (distance > limit) return distance;
-      }
-      return distance;
-  }
-  async function groupSimilarImages(imageHashes, similarityThreshold, hashSize, core) {
-      const groups = [];
-      const maxDistance = (1 - similarityThreshold) * hashSize * hashSize;
-      for (let i = 0; i < imageHashes.length; i++) {
-          if (!core.isProcessRunning) return groups.filter((g) => g.length > 1);
-          const image = imageHashes[i];
-          let added = false;
-          for (const group of groups) {
-              if (hammingDistance(image.hash, group[0].hash, maxDistance) <= maxDistance) {
-                  group.push(image);
-                  added = true;
-                  break;
-              }
-          }
-          if (!added) groups.push([image]);
-          if (i % 200 === 199) await defer(() => { });
-      }
-      return groups.filter((group) => group.length > 1);
-  }
-  async function fetchImageBlobs(mediaItems, maxConcurrency, imageHeight, core) {
-      const fetchOne = async (item, retries = 3) => {
-          for (let attempt = 1; attempt <= retries; attempt++) {
-              if (!core.isProcessRunning) return null;
-              try {
-                  const response = await fetch(`${item.thumb}=h${imageHeight}`, {
-                      cache: 'force-cache',
-                      credentials: 'include',
-                      signal: AbortSignal.timeout(10000),
-                  });
-                  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                  if (!core.isProcessRunning) return null;
-                  return { ...item, blob: await response.blob() };
-              }
-              catch (error) {
-                  if (attempt < retries) {
-                      await sleep(1000 * attempt);
-                  }
-                  else {
-                      log(`Failed to fetch thumb ${item.mediaKey} after ${retries} attempts: ${errorMessage(error)}`, 'error');
-                  }
-              }
-          }
-          return null;
-      };
-      const results = [];
-      let cursor = 0; // index-based queue: Array#shift is O(n) per call on large libraries
-      const worker = async () => {
-          while (cursor < mediaItems.length && core.isProcessRunning) {
-              const item = mediaItems[cursor++];
-              const result = await fetchOne(item);
-              if (result) results.push(result);
-              if (results.length && results.length % 500 === 0) log(`Fetched ${results.length} thumbnails`);
-          }
-      };
-      await Promise.all(Array.from({ length: Math.min(maxConcurrency, mediaItems.length) }, () => worker()));
-      return results;
-  }
-  function calculateHashSize(imageHeight) {
-      return Math.min(32, Math.max(8, Math.floor(Math.sqrt(imageHeight) / 4)));
-  }
-  async function filterSimilar(core, mediaItems, filter) {
-      const similarityThreshold = Number(filter.similarityThreshold) || 0.9;
-      const imageHeight = Number(filter.imageHeight) || 100;
-      const hashSize = calculateHashSize(imageHeight);
-      const itemsWithThumbs = mediaItems.filter((item) => !!item.thumb);
-      const skippedCount = mediaItems.length - itemsWithThumbs.length;
-      if (skippedCount > 0) log(`Skipped ${skippedCount} items with no thumbnail`);
-      log('Fetching images');
-      const itemsWithBlobs = await fetchImageBlobs(itemsWithThumbs, 50, imageHeight, core);
-      if (!core.isProcessRunning) return [];
-      log('Generating image hashes');
-      const itemsWithHashes = await processBatch(itemsWithBlobs, async (item) => {
-          const hash = await generateImageHash(hashSize, item.blob, core);
-          return hash !== null ? { ...item, blob: undefined, hash } : null;
-      }, 50, core);
-      if (!core.isProcessRunning) return [];
-      log('Grouping similar images');
-      const groups = await groupSimilarImages(itemsWithHashes, similarityThreshold, hashSize, core);
-      const flattened = groups.flat().map(({ hash, blob, ...rest }) => rest);
-      log(`Found ${flattened.length} similar items across ${groups.length} groups`);
-      return flattened;
-  }
-
   // ════════════════════════════════════════════════════════════
   //  Core: fetch → filter → act
   // ════════════════════════════════════════════════════════════
@@ -2526,9 +2347,6 @@
                   if (condition && filteredItems.length) filteredItems = method();
               }
               if (filter.sortBySize) filteredItems.sort((a, b) => (b.size ?? 0) - (a.size ?? 0));
-          }
-          if (filteredItems.length > 0 && filter.similarityThreshold && this.isProcessRunning) {
-              filteredItems = await filterSimilar(this, filteredItems, filter);
           }
           return filteredItems;
       }
@@ -2696,7 +2514,7 @@
                   source,
                   targetAlbum,
                   newTargetAlbumName,
-                  preserveOrder: Boolean(filter.similarityThreshold ?? filter.sortBySize),
+                  preserveOrder: Boolean(filter.sortBySize),
               });
               if (this.isProcessRunning) log(`Task completed in ${timeToHHMMSS(Date.now() - startTime)}`, 'success');
               else log('Stopped before completion; some items may already have been processed', 'warn');
@@ -3345,11 +3163,9 @@
 
   function gmBlob(url) {
     return new Promise((res, rej) => {
-      if (typeof GM_xmlhttpRequest === 'function') {
-        GM_xmlhttpRequest({ method: 'GET', url, responseType: 'blob', timeout: 20000,
-          onload: r => (r.status >= 200 && r.status < 300 && r.response ? res(r.response) : rej(new Error('HTTP ' + r.status))),
-          onerror: () => rej(new Error('network')), ontimeout: () => rej(new Error('timeout')) });
-      } else fetch(url, { credentials: 'include' }).then(r => r.ok ? r.blob() : Promise.reject(new Error('HTTP ' + r.status))).then(res, rej);
+      GM_xmlhttpRequest({ method: 'GET', url, responseType: 'blob', timeout: 20000,
+        onload: r => (r.status >= 200 && r.status < 300 && r.response ? res(r.response) : rej(new Error('HTTP ' + r.status))),
+        onerror: () => rej(new Error('network')), ontimeout: () => rej(new Error('timeout')) });
     });
   }
   const cvA = document.createElement('canvas'); cvA.width = 9; cvA.height = 8;
@@ -3366,7 +3182,6 @@
 
   /* ------------------------------------------------------------------ styles */
   const css = `
-  #gpdf-btn{position:fixed;right:20px;bottom:20px;z-index:2147482000;background:#1a73e8;color:#fff;border:0;border-radius:24px;padding:10px 16px;font:600 14px/1 system-ui,sans-serif;box-shadow:0 2px 8px #0004;cursor:pointer}
   #gpdf{position:fixed;inset:0;z-index:2147483000;background:#f4f5f7;color:#1c2128;font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column}
   #gpdf *{box-sizing:border-box}
   #gpdf .top,#gpdf .bar{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;padding:10px 20px;background:#fff;border-bottom:1px solid #dde1e6}
@@ -3420,7 +3235,7 @@
     root.append(renderTop(), bar, main);
     document.body.append(root);
     renderAll();
-    loadAlbumList();
+    S.albumsReady = loadAlbumList(); // scan() waits for it, so album carry-over never runs on a half-loaded list
   }
   function renderTop() {
     const o = S.opts;
@@ -3441,7 +3256,11 @@
       do { const p = await api().getAlbums(pid); if (!p) break; pid = p.nextPageId || null; out.push(...(p.items || []).filter(a => !a.isShared)); } while (pid);
       S.albums = out;
       for (const a of out.sort((x, y) => lower(x.title).localeCompare(lower(y.title)))) S.srcSelect.append(h('option', { value: a.mediaKey }, `Album: ${a.title} (${a.itemCount ?? '?'})`));
-    } catch (e) { /* album list is optional */ }
+    } catch (e) {
+      // without the list, "add kept photo to the albums of removed copies" would silently do nothing; apply() refuses instead
+      S.albumsFailed = true; console.error('[duplicate finder] album list', e);
+      S.status.textContent = 'Could not read your album list. Reload the page before removing duplicates.';
+    }
   }
 
   /* ------------------------------------------------------------------ scan */
@@ -3498,6 +3317,7 @@
       }
       // 4. albums each item is in (to carry them over to the kept photo)
       setStatus('Reading albums…');
+      await S.albumsReady;
       S.inAlbums = new Map(); S.albumTitle = {};
       await pool(S.albums, 3, async a => {
         S.albumTitle[a.mediaKey] = a.title; let pid = null;
@@ -3505,8 +3325,7 @@
           for (const it of p.items || []) (S.inAlbums.get(it.dedupKey) || S.inAlbums.set(it.dedupKey, new Set()).get(it.dedupKey)).add(a.mediaKey); } while (pid);
       });
       setStatus('Grouping…');
-      await new Promise(z => setTimeout(z, 0));
-      group(o);
+      await group(o);
       S.filter = 'open'; S.page = 0;
       S.status.textContent = `${S.items.length.toLocaleString()} items scanned · ${S.groups.length} groups`;
       scanning = false;
@@ -3515,7 +3334,7 @@
     finally { scanning = false; }
   }
 
-  function group(o) {
+  async function group(o) {
     const F = S.items, n = F.length, par = new Int32Array(n).map((_, i) => i);
     const find = x => { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
     const why = new Map();
@@ -3530,8 +3349,12 @@
     if (o.looks) {
       const idx = []; F.forEach((f, i) => { if (f.dh) { const b = pop(f.dh[0]) + pop(f.dh[1]); if (b >= 6 && b <= 58) idx.push(i); } });
       const H = new Uint32Array(idx.map(i => F[i].dh[0])), L = new Uint32Array(idx.map(i => F[i].dh[1]));
-      for (let x = 0; x < idx.length; x++) for (let y = x + 1; y < idx.length; y++)
-        if (pop(H[x] ^ H[y]) + pop(L[x] ^ L[y]) <= o.thr && sameAspect(F[idx[x]], F[idx[y]])) link(idx[x], idx[y], 'looks');
+      for (let x = 0; x < idx.length; x++) {
+        // every photo vs every other: ~8 s at 60k photos, so yield now and then to keep the tab responsive
+        if (x % 500 === 499) { setStatus(`Comparing look-alikes… ${x.toLocaleString()}/${idx.length.toLocaleString()}`, x / idx.length); await new Promise(z => setTimeout(z, 0)); }
+        for (let y = x + 1; y < idx.length; y++)
+          if (pop(H[x] ^ H[y]) + pop(L[x] ^ L[y]) <= o.thr && sameAspect(F[idx[x]], F[idx[y]])) link(idx[x], idx[y], 'looks');
+      }
     }
     const gm = new Map();
     for (let i = 0; i < n; i++) { if (!why.has(i)) continue; const r = find(i); (gm.get(r) || gm.set(r, []).get(r)).push(i); }
@@ -3559,7 +3382,8 @@
 
   /* ------------------------------------------------------------------ render */
   const REASON = { same: ['c-same', 'Same name + size'], moment: ['c-moment', 'Same moment'], looks: ['c-looks', 'Look-alike'], name: ['c-name', 'Same name'] };
-  function toTrash() { const out = []; for (const g of S.groups) if (g.status === 'dup') for (const i of g.ids) if (!g.keep.has(i)) out.push({ it: S.items[i], g }); return out; }
+  // a confirmed group with nothing kept (last "Keep" un-ticked) is skipped: never trash every copy
+  function toTrash() { const out = []; for (const g of S.groups) if (g.status === 'dup' && g.keep.size) for (const i of g.ids) if (!g.keep.has(i)) out.push({ it: S.items[i], g }); return out; }
   function renderAll() { renderBar(); renderList(); }
   function renderBar() {
     if (!bar) return;
@@ -3625,7 +3449,10 @@
 
   /* ------------------------------------------------------------------ apply */
   async function apply() {
+    // a running scan has already replaced S.items, so the old groups' indices would point at different photos
+    if (scanning) { alert('Wait for the scan to finish.'); return; }
     const tt = toTrash(); if (!tt.length) return;
+    if (S.keepAlbums && S.albumsFailed) { alert('Your album list could not be read, so kept photos cannot be added to the albums of removed copies.\nReload the page and scan again, or untick "Add kept photo to the albums of removed copies".'); return; }
     const groups = [...new Set(tt.map(x => x.g))];
     if (!confirm(`Move ${tt.length} duplicate(s) from ${groups.length} group(s) to Google Photos trash?` +
       (S.keepAlbums ? '\nKept photos will first be added to the albums the removed copies were in.' : '') +

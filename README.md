@@ -51,7 +51,7 @@ Albums you create later aren't included until you refresh and press **All** agai
 3. Press **Scan**. The first look-alike scan downloads a tiny thumbnail of every photo, so it's slow on big libraries. Later scans are fast.
 4. For each group, choose which copy to **keep** (the sharpest and largest one is pre-selected), then **Duplicates: keep selected** or **Not duplicates**. Your decisions are remembered between visits.
 5. Press **Move N to trash**. Optional extras:
-   - *Add kept photo to the albums of removed copies* (on by default), so albums don't lose photos.
+   - *Add kept photo to the albums of removed copies* (on by default), so albums don't lose photos. This covers your own albums only, not shared albums.
    - *Give kept photo the oldest date taken*.
 6. **Download log** saves a CSV of what was kept and what was removed.
 
@@ -67,6 +67,10 @@ Shared albums, partner-shared items and the Locked Folder are separate sources. 
 - Everything runs in your browser using your own Google session. Nothing is sent anywhere else.
 - Google Photos has no public API for this, so the script uses the same internal requests the website itself makes. If Google changes those, parts of the script may stop working until it's updated.
 - Very large libraries (tens of thousands of items) take a while to read. Keep the tab open and in the foreground.
+
+## Development
+
+`node test.js` checks the date-from-filename parser and the duplicate finder's trash list. Run it before each release.
 
 ## Credits & license
 
